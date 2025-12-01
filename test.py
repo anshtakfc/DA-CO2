@@ -116,6 +116,8 @@ if not os.path.exists(local_path_entsoe):
   # Convert Series to DataFrame if necessary
   if isinstance(df_entsoe, pd.Series):
       df_entsoe = df_entsoe.to_frame()
+  # Rename the column to 'day_ahead_prices' before saving
+  df_entsoe.columns = ['day_ahead_price']
   df_entsoe.to_csv(local_path_entsoe, index=True)
   print("ENTSO-E data saved")
 else:
@@ -169,19 +171,15 @@ df_ggc_aligned = pd.concat([df_ggc[~is_dst], df_dst_shifted])
 df_ggc_aligned = df_ggc_aligned[~df_ggc_aligned.index.duplicated(keep='first')]
 df_ggc_aligned = df_ggc_aligned.sort_index()
 
-
-# Rename the column in df_entsoe for clarity
-df_entsoe_renamed = df_entsoe.rename(columns={df_entsoe.columns[0]: 'DA_Price'})
-
 # Merge the two dataframes on their index (timestamps)
 # Use an outer join to keep all timestamps, then fill NaNs if necessary, or resample to common frequency
-combined_df = pd.merge(df_entsoe_renamed, df_ggc_aligned[['production_co2_intensity', 'production_co2_emitted']], left_index=True, right_index=True, how='inner')
+combined_df = pd.merge(df_entsoe, df_ggc_aligned[['production_co2_intensity', 'production_co2_emitted']], left_index=True, right_index=True, how='inner')
 
 # Create the plot
 fig, ax1 = plt.subplots(figsize=(14, 7))
 
 # Plot Day-Ahead Prices on the first y-axis
-ax1.lineplot(combined_df.index, y='DA_Price', data=combined_df, ax=ax1, color='blue', label='Day-Ahead Price (€/MWh)', linewidth=0.7)
+ax1.plot(combined_df.index, combined_df['day_ahead_price'], color='blue', label='Day-Ahead Price (€/MWh)', linewidth=0.7)
 ax1.set_xlabel('Timestamp')
 ax1.set_ylabel('Day-Ahead Price (€/MWh)', color='blue')
 ax1.tick_params(axis='y', labelcolor='blue')
@@ -191,7 +189,7 @@ ax1.legend(loc='upper left') # Add legend for ax1
 ax2 = ax1.twinx()
 
 # Plot CO2 Intensity on the second y-axis
-sns.lineplot(x=combined_df.index, y='production_co2_intensity', data=combined_df, ax=ax2, color='red', label='CO2 Intensity (gCO2eq/kWh)', linewidth=0.7)
+ax2.plot(combined_df.index, combined_df['production_co2_intensity'], color='red', label='CO2 Intensity (gCO2eq/kWh)', linewidth=0.7)
 ax2.set_ylabel('CO2 Intensity (gCO2eq/kWh)', color='red')
 ax2.tick_params(axis='y', labelcolor='red')
 ax2.legend(loc='upper right') # Add legend for ax2
