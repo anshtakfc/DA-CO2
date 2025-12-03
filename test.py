@@ -1,17 +1,8 @@
 import pandas as pd
-import numpy as np
 import matplotlib.pyplot as plt
-import math
 import seaborn as sns
-from IPython.display import display
 
 from sklearn.preprocessing import StandardScaler
-from sklearn.decomposition import PCA
-from sklearn.manifold import TSNE
-from sklearn.cluster import KMeans, AgglomerativeClustering
-from sklearn.metrics import silhouette_score
-from scipy.cluster.hierarchy import dendrogram, linkage, fcluster
-
 sns.set(style='whitegrid', context='talk')
 
 import json
@@ -131,106 +122,147 @@ else:
     # Join ENTSO-E prices onto GGC intervals (left join keeps all GGC rows)
     combined_df = df_ggc_raw.join(df_entsoe, how="left")
 
-    # Optional sanity checks
     # Ensure index name
     combined_df.index.name = "interval"
 
     # Save single CSV
     combined_df.to_csv(combined_path)
     print(f"Combined data saved to {combined_path}")
+    
+# Ensure the index is a timezone-aware DatetimeIndex in Europe/Berlin
+if not isinstance(combined_df.index, pd.DatetimeIndex):
+    # Try parsing with UTC, then convert to Europe/Berlin
+    combined_df.index = pd.to_datetime(combined_df.index, utc=True, errors='coerce')
 
+# If still tz-naive (can happen if CSV lost tz info), localize to UTC then convert
+if combined_df.index.tz is None:
+    combined_df.index = combined_df.index.tz_localize('UTC')
 
-# Create the plot
-fig, ax1 = plt.subplots(figsize=(14, 7))
+# Finally convert to Europe/Berlin
+combined_df.index = combined_df.index.tz_convert('Europe/Berlin')
+combined_df.index.name = 'interval'
 
-# Plot Day-Ahead Prices on the first y-axis
-ax1.plot(combined_df.index, combined_df['day_ahead_price'], color='blue', label='Day-Ahead Price (€/MWh)', linewidth=0.7)
-ax1.set_xlabel('Timestamp')
-ax1.set_ylabel('Day-Ahead Price (€/MWh)', color='blue')
-ax1.tick_params(axis='y', labelcolor='blue')
-ax1.legend(loc='upper left') # Add legend for ax1
+# -----------------------------
+# Feature engineering
+# -----------------------------
+# Time-based features
+combined_df["hour"] = combined_df.index.hour
+combined_df["dow"] = combined_df.index.dayofweek  # 0=Mon, 6=Sun
+combined_df["month"] = combined_df.index.month
 
-# Create a second y-axis for CO2 Intensity
-ax2 = ax1.twinx()
+# Seasons (meteorological): Winter(12,1,2), Spring(3,4,5), Summer(6,7,8), Autumn(9,10,11)
+def season_from_month(m):
+    if m in (12, 1, 2):
+        return "winter"
+    elif m in (3, 4, 5):
+        return "spring"
+    elif m in (6, 7, 8):
+        return "summer"
+    else:
+        return "autumn"
+combined_df["season"] = combined_df["month"].apply(season_from_month)
 
-# Plot CO2 Intensity on the second y-axis
-ax2.plot(combined_df.index, combined_df['production_co2_intensity'], color='red', label='CO2 Intensity (gCO2eq/kWh)', linewidth=0.7)
-ax2.set_ylabel('CO2 Intensity (gCO2eq/kWh)', color='red')
-ax2.tick_params(axis='y', labelcolor='red')
-ax2.legend(loc='upper right') # Add legend for ax2
+# One-hot encode season for correlation with numeric targets
+season_dummies = pd.get_dummies(combined_df["season"], prefix="season")
+combined_df = pd.concat([combined_df, season_dummies], axis=1)
 
-# Add title and grid
-plt.title('Day-Ahead Prices, CO2 Intensity (Actual)')
-fig.tight_layout() # Adjust layout to prevent overlapping elements
-plt.grid(True)
-plt.show()
+# Morning/evening profiles (typical load/price/CO2 patterns)
+combined_df["is_morning_peak"] = combined_df["hour"].between(7, 10).astype(int)
+combined_df["is_evening_peak"] = combined_df["hour"].between(17, 21).astype(int)
 
-corr_matrix = combined_df.corr(method='pearson')
+# Weekday/weekend flags
+combined_df["is_weekend"] = (combined_df["dow"] >= 5).astype(int)
 
-plt.figure(figsize=(10, 8))
+# Lag features (previous hour/day) for price/intensity/emitted
+combined_df["day_ahead_price_lag1h"] = combined_df["day_ahead_price"].shift(1)
+combined_df["day_ahead_price_lag24h"] = combined_df["day_ahead_price"].shift(24)
+combined_df["production_co2_intensity_lag1h"] = combined_df["production_co2_intensity"].shift(1)
+combined_df["production_co2_intensity_lag24h"] = combined_df["production_co2_intensity"].shift(24)
+combined_df["production_co2_emitted_lag1h"] = combined_df["production_co2_emitted"].shift(1)
+combined_df["production_co2_emitted_lag24h"] = combined_df["production_co2_emitted"].shift(24)
+
+# Inter-hour changes (momentum)
+combined_df["price_delta_1h"] = combined_df["day_ahead_price"].diff(1)
+combined_df["intensity_delta_1h"] = combined_df["production_co2_intensity"].diff(1)
+combined_df["emitted_delta_1h"] = combined_df["production_co2_emitted"].diff(1)
+
+# -----------------------------
+# Correlation analysis
+# -----------------------------
+# Choose numeric columns for correlation
+corr_cols = [
+    "day_ahead_price",
+    "production_co2_intensity",
+    "production_co2_emitted",
+    "hour", "dow", "is_weekend",
+    "is_morning_peak", "is_evening_peak",
+    "season_winter", "season_spring", "season_summer", "season_autumn",
+    "day_ahead_price_lag1h", "day_ahead_price_lag24h",
+    "production_co2_intensity_lag1h", "production_co2_intensity_lag24h",
+    "production_co2_emitted_lag1h", "production_co2_emitted_lag24h",
+    "price_delta_1h", "intensity_delta_1h", "emitted_delta_1h",
+]
+
+corr_df = combined_df[corr_cols].dropna(how="any")  # drop rows where lags create NaNs
+
+# Correlation on actual values
+corr_matrix_actual = corr_df.corr(method='pearson')
+
+plt.figure(figsize=(18, 16))
 sns.heatmap(
-    corr_matrix,
+    corr_matrix_actual,
     annot=True,
-    fmt='.2f',
     cmap='coolwarm',
+    center=0,
     square=True,
     cbar_kws={'label': 'Correlation Coefficient'}
 )
-plt.title('Feature Correlation Matrix (Pearson), Actual', fontsize=14)
-
+plt.title('Feature Correlation Matrix (Actual Values)', fontsize=14)
 plt.xticks(rotation=45, ha='right')
 plt.yticks(rotation=0)
 plt.tight_layout()
 plt.show()
 
-
-# Create a temporary copy of combined_df for this specific correlation analysis
-correlation = combined_df.copy()
-
-# Select numeric columns for normalization that exist at this stage
+corr_df_norm = combined_df.copy()
 cols = ['day_ahead_price', 'production_co2_intensity', 'production_co2_emitted']
+scaler = StandardScaler()
+corr_df_norm[cols] = scaler.fit_transform(combined_df[cols])
 
-# Drop rows with NaN values in these columns to avoid issues with StandardScaler
-correlation = correlation.dropna(subset=cols)
+# -----------------------------
+# Visual checks that help explain correlations
+# -----------------------------
+# 1) Hour-of-day averages: price vs intensity/emitted
 
-# Initialize StandardScaler
-scaler_temp = StandardScaler()
 
-# Fit and transform the selected numeric columns
-correlation[cols] = scaler_temp.fit_transform(correlation[cols])
 
-# Calculate the correlation matrix on the normalized temporary DataFrame
-corr_matrix = correlation[cols].corr(method='pearson')
+hourly_means = corr_df_norm.groupby("hour")[cols].mean()
 
-# Plot the correlation matrix
-plt.figure(figsize=(8, 6))
-sns.heatmap(
-    corr_matrix,
-    annot=True,
-    fmt='.2f',
-    cmap='coolwarm',
-    square=True,
-    cbar_kws={'label': 'Correlation Coefficient'}
-)
-plt.title('Correlation Matrix (Normalized)', fontsize=14)
-plt.xticks(rotation=45, ha='right')
-plt.yticks(rotation=0)
-plt.tight_layout()
-plt.show()
-
-# Create the plot
-fig, ax1 = plt.subplots(figsize=(14, 7))
-
-# Plot Day-Ahead Prices on the first y-axis
-ax1.plot(correlation.index, correlation['day_ahead_price'], color='blue', label='Day-Ahead Price (€/MWh)', linewidth=0.7)
-ax1.plot(correlation.index, correlation['production_co2_intensity'], color='red', label='CO2 Intensity (gCO2eq/kWh)', linewidth=0.7)
-ax1.set_xlabel('Timestamp')
-ax1.set_ylabel('Values')
-ax1.tick_params(axis='y')
-ax1.legend(loc='upper left') # Add legend for ax1
-
-# Add title and grid
-plt.title('Day-Ahead Prices, CO2 Intensity (normalized)')
-fig.tight_layout() # Adjust layout to prevent overlapping elements
+plt.figure(figsize=(12, 5))
+plt.plot(hourly_means.index, hourly_means["day_ahead_price"], label="Day-Ahead Price", color="blue")
+plt.plot(hourly_means.index, hourly_means["production_co2_intensity"], label="CO2 Intensity", color="red")
+plt.plot(hourly_means.index, hourly_means["production_co2_emitted"], label="CO2 Emitted", color="green")
+plt.title("Hour-of-Day Profiles (Averaged over the year)")
+plt.xlabel("Hour")
+plt.ylabel("Mean value")
 plt.grid(True)
-plt.show()
+plt.legend()
+plt.tight_layout()
+
+# 2) Weekday vs weekend profiles
+weekday_means = corr_df_norm.groupby("is_weekend")[cols].mean()
+plt.figure(figsize=(8, 5))
+weekday_means.plot(kind="bar")
+plt.title("Weekday vs Weekend Averages")
+plt.xlabel("is_weekend (0=weekday,1=weekend)")
+plt.ylabel("Mean value")
+plt.grid(True)
+plt.tight_layout()
+
+# 3) Seasonal averages
+season_means = corr_df_norm.groupby("season")[["day_ahead_price", "production_co2_intensity", "production_co2_emitted"]].mean().loc[["winter","spring","summer","autumn"]]
+plt.figure(figsize=(8, 5))
+season_means.plot(kind="bar")
+plt.title("Seasonal Averages")
+plt.ylabel("Mean value")
+plt.grid(True)
+plt.tight_layout()
