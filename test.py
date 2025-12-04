@@ -9,6 +9,7 @@ import json
 from entsoe import EntsoePandasClient
 import requests
 import os
+import sys
 
 year = 2023 # Set required year
 start = pd.Timestamp(f'{year}-01-01 00:00', tz='Europe/Berlin')
@@ -21,7 +22,7 @@ os.makedirs("data", exist_ok=True)
 combined_path = f"data/{country_code}_{year}_co2_price.csv"
 
 # Function to retrieve ENTSO-E Data
-def get_entsoe_data(year: int, country_code: str, entsoe_key: str) -> pd.DataFrame:
+def get_entsoe_data(year, country_code, entsoe_key) -> pd.DataFrame:
     client = EntsoePandasClient(api_key=entsoe_key)
     monthly_data = []
     for month in range(1, 13):
@@ -54,6 +55,51 @@ def get_entsoe_data(year: int, country_code: str, entsoe_key: str) -> pd.DataFra
         entsoe = entsoe.to_frame()
     entsoe.columns = ['day_ahead_price']
     return entsoe
+
+def load_entsoe_from_csv(year, country_code, entsoe_key, csv_path: str) -> pd.DataFrame:
+    if os.path.exists(csv_path):
+        df_raw = pd.read_csv(csv_path, sep=',', encoding='utf-8-sig', engine='python')
+
+        mtu_col = "MTU (CET/CEST)"
+        area_col = "Area"
+        seq_col = "Sequence"
+        price_col = "Day-ahead Price (EUR/MWh)"
+
+        df = df_raw[df_raw[area_col] == "BZN|DE-LU"].copy()
+        df = df[df[seq_col].str.contains("Sequence 1", na=False)]
+
+        start_strings = df[mtu_col].astype(str).str.split(" - ").str[0]
+        dt_start = pd.to_datetime(start_strings, format="%d/%m/%Y %H:%M:%S", errors="coerce")
+        dt_start = dt_start.dt.tz_localize('Europe/Berlin', ambiguous='infer', nonexistent='shift_forward')
+
+        price_str = df[price_col].astype(str)
+        price_str = price_str.str.strip()
+        price_str = (
+            price_str
+            .str.replace('\u00A0', '', regex=False)   # non-breaking space
+            .str.replace(',', '', regex=False)        # remove thousands separators if any
+            )
+        price_str = price_str.str.extract(r'^\s*([+-]?\d+(?:\.\d+)?)\s*$', expand=False)
+        price_vals = pd.to_numeric(price_str, errors='coerce')
+        s_15m = pd.Series(price_vals.values, index=dt_start).sort_index()
+        s_hourly = s_15m.resample("h").mean()
+
+        df_prices = s_hourly.to_frame(name="day_ahead_price")
+        df_prices.index.name = "interval"
+        df_prices = df_prices.dropna(how="all")
+
+        return df_prices
+    print("[ENTSOE] Cache not found, calling API...")
+    df = get_entsoe_data(year, country_code, entsoe_key)
+    if df.empty:
+        print("[ENTSOE] Warning: API returned empty ENTSOE data.")
+        return df
+    # Save cleaned, timezone-consistent CSV with UTC index for portability
+    df_to_save = df.copy()
+    df_to_save.to_csv(csv_path)
+    print(f"[ENTSOE] Cleaned GGC data cached at {csv_path}")
+    return df
+    
 
 # Function to retrieve GGC Data
 
@@ -104,23 +150,47 @@ def get_ggc_data(year, country_code, ggc_key, limit=3139):
         ggc = ggc.sort_index()
         return ggc
 
+# Cached GGC loader/saver: use cache if present, else call API and save cleaned CSV
+def load_or_fetch_ggc(year, country_code, ggc_key, cache_path: str) -> pd.DataFrame:
+    if os.path.exists(cache_path):
+        print(f"[GGC] Loading cached GGC data from {cache_path}")
+        df = pd.read_csv(cache_path, index_col=0)
+        # Restore timezone-aware index (cache stores ISO strings)
+        idx = pd.to_datetime(df.index, utc=True, errors='coerce').tz_convert('Europe/Berlin')
+        df.index = idx
+        df.index.name = 'interval'
+        # Ensure numeric types
+        for col in ["production_co2_intensity", "production_co2_emitted"]:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+        df = df.sort_index()
+        return df
+    print("[GGC] Cache not found, calling API...")
+    df = get_ggc_data(year, country_code, ggc_key)
+    if df.empty:
+        print("[GGC] Warning: API returned empty GGC data.")
+        return df
+    # Save cleaned, timezone-consistent CSV with UTC index for portability
+    df_to_save = df.copy()
+    df_to_save.index = df_to_save.index.tz_convert('UTC')  # store as UTC in CSV
+    df_to_save.to_csv(cache_path)
+    print(f"[GGC] Cleaned GGC data cached at {cache_path}")
+    return df
+
 if os.path.exists(combined_path):
     print("Combined file already exists. Loading...")
     combined_df = pd.read_csv(combined_path, index_col=0, parse_dates=True)
     combined_df.index.name = "interval"
 else:
     # Fetch GGC first
-    df_ggc_raw = get_ggc_data(year, country_code, ggc_key)
-    if df_ggc_raw.empty:
+    df_ggc = load_or_fetch_ggc(year, country_code, ggc_key, cache_path=f"data/DE_LU_{year}_ggc.csv")
+    if df_ggc.empty:
         raise RuntimeError("No GGC data retrieved; cannot build combined file.")
-
-    # Fetch ENTSO-E data
-    df_entsoe = get_entsoe_data(year, country_code, entsoe_key)
+    df_entsoe = load_entsoe_from_csv(year, country_code, entsoe_key, csv_path=f"data/DE_LU_{year}_entsoe.csv")
     if df_entsoe.empty:
-        print("Warning: ENTSO-E data empty; combined file will lack day_ahead_price values.")
-
+        raise RuntimeError("No ENTSOE data retrieved; cannot build combined file.")
+    
     # Join ENTSO-E prices onto GGC intervals (left join keeps all GGC rows)
-    combined_df = df_ggc_raw.join(df_entsoe, how="left")
+    combined_df = df_ggc.join(df_entsoe, how="left")
 
     # Ensure index name
     combined_df.index.name = "interval"
@@ -207,24 +277,26 @@ corr_df = combined_df[corr_cols].dropna(how="any")  # drop rows where lags creat
 
 # Correlation on actual values
 corr_matrix_actual = corr_df.corr(method='pearson')
+cols = ['day_ahead_price', 'production_co2_intensity', 'production_co2_emitted']
+corr_matrix_thin = corr_matrix_actual.loc[:, cols]
 
-plt.figure(figsize=(18, 16))
+fig, ax = plt.subplots(figsize=(6.5, 12))  # tall figure
 sns.heatmap(
-    corr_matrix_actual,
+    corr_matrix_thin,
     annot=True,
+    fmt='.2f',
     cmap='coolwarm',
     center=0,
-    square=True,
-    cbar_kws={'label': 'Correlation Coefficient'}
+    cbar_kws={'label': 'Correlation Coefficient'},
+    ax=ax
 )
-plt.title('Feature Correlation Matrix (Actual Values)', fontsize=14)
+ax.set_title(f'Correlations against key variables {year}')
 plt.xticks(rotation=45, ha='right')
 plt.yticks(rotation=0)
 plt.tight_layout()
 plt.show()
 
 corr_df_norm = combined_df.copy()
-cols = ['day_ahead_price', 'production_co2_intensity', 'production_co2_emitted']
 scaler = StandardScaler()
 corr_df_norm[cols] = scaler.fit_transform(combined_df[cols])
 
@@ -232,37 +304,69 @@ corr_df_norm[cols] = scaler.fit_transform(combined_df[cols])
 # Visual checks that help explain correlations
 # -----------------------------
 # 1) Hour-of-day averages: price vs intensity/emitted
-
-
-
 hourly_means = corr_df_norm.groupby("hour")[cols].mean()
 
-plt.figure(figsize=(12, 5))
-plt.plot(hourly_means.index, hourly_means["day_ahead_price"], label="Day-Ahead Price", color="blue")
-plt.plot(hourly_means.index, hourly_means["production_co2_intensity"], label="CO2 Intensity", color="red")
-plt.plot(hourly_means.index, hourly_means["production_co2_emitted"], label="CO2 Emitted", color="green")
-plt.title("Hour-of-Day Profiles (Averaged over the year)")
-plt.xlabel("Hour")
-plt.ylabel("Mean value")
-plt.grid(True)
-plt.legend()
+fig, ax = plt.subplots(figsize=(10, 5))
+ax.plot(hourly_means.index, hourly_means["day_ahead_price"], label="Day-Ahead Price", color="blue")
+ax.plot(hourly_means.index, hourly_means["production_co2_intensity"], label="CO2 Intensity", color="red")
+ax.plot(hourly_means.index, hourly_means["production_co2_emitted"], label="CO2 Emitted", color="green")
+ax.set_title(f"Hour-of-Day Profiles (Normalized Averages) {year}")
+ax.set_xlabel("Hour")
+ax.set_ylabel("Normalized mean")
+ax.grid(True)
+ax.legend()
 plt.tight_layout()
+plt.show()
 
-# 2) Weekday vs weekend profiles
+# -----------------------------
+# Plot 3: Weekday vs Weekend profiles
+# -----------------------------
 weekday_means = corr_df_norm.groupby("is_weekend")[cols].mean()
-plt.figure(figsize=(8, 5))
-weekday_means.plot(kind="bar")
-plt.title("Weekday vs Weekend Averages")
-plt.xlabel("is_weekend (0=weekday,1=weekend)")
-plt.ylabel("Mean value")
-plt.grid(True)
-plt.tight_layout()
 
-# 3) Seasonal averages
-season_means = corr_df_norm.groupby("season")[["day_ahead_price", "production_co2_intensity", "production_co2_emitted"]].mean().loc[["winter","spring","summer","autumn"]]
-plt.figure(figsize=(8, 5))
-season_means.plot(kind="bar")
-plt.title("Seasonal Averages")
-plt.ylabel("Mean value")
-plt.grid(True)
+fig, ax = plt.subplots(figsize=(8, 5))
+weekday_means.plot(kind="bar", ax=ax)
+ax.set_title(f"Weekday vs Weekend Averages (Normalized) {year}")
+ax.set_xlabel("is_weekend (0=weekday,1=weekend)")
+ax.set_ylabel("Normalized mean")
+ax.grid(True)
 plt.tight_layout()
+plt.show()
+
+# -----------------------------
+# Plot 4: Seasonal averages
+# -----------------------------
+season_order = ["winter", "spring", "summer", "autumn"]
+season_means = corr_df_norm.groupby("season")[cols].mean().reindex(season_order)
+
+fig, ax = plt.subplots(figsize=(8, 5))
+season_means.plot(kind="bar", ax=ax)
+ax.set_title(f"Seasonal Averages (Normalized) {year}")
+ax.set_ylabel("Normalized mean")
+ax.grid(True)
+plt.tight_layout()
+plt.show()
+
+# Create the plot
+fig, ax1 = plt.subplots(figsize=(14, 7))
+
+# Plot Day-Ahead Prices on the first y-axis
+ax1.plot(combined_df.index, combined_df['day_ahead_price'], color='blue', label='Day-Ahead Price (€/MWh)', linewidth=0.7)
+ax1.set_xlabel('Timestamp')
+ax1.set_ylabel('Day-Ahead Price (€/MWh)', color='blue')
+ax1.tick_params(axis='y', labelcolor='blue')
+ax1.legend(loc='upper left') # Add legend for ax1
+
+# Create a second y-axis for CO2 Intensity
+ax2 = ax1.twinx()
+
+# Plot CO2 Intensity on the second y-axis
+ax2.plot(combined_df.index, combined_df['production_co2_intensity'], color='red', label='CO2 Intensity (gCO2eq/kWh)', linewidth=0.7)
+ax2.set_ylabel('CO2 Intensity (gCO2eq/kWh)', color='red')
+ax2.tick_params(axis='y', labelcolor='red')
+ax2.legend(loc='upper right') # Add legend for ax2
+
+# Add title and grid
+plt.title(f'Day-Ahead Prices, CO2 Intensity (Actual) {year}')
+fig.tight_layout() # Adjust layout to prevent overlapping elements
+plt.grid(True)
+plt.show()
